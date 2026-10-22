@@ -14,4 +14,8 @@
 
 ## Project Architecture
 
+The system is a modular pipeline for detecting traffic events (stopped vehicle, wrong-way driving, congestion, sudden braking) from fixed highway cameras, using the A9 dataset.
+
+The data is first converted to YOLO format with a9-devkit. Vehicles are then detected with a YOLO model trained on A9 and tracked with ByteTrack/BoT-SORT. From the resulting trajectories, the system computes features (speed, direction, acceleration, lane), which a rule-based event detection module uses together with a scene configuration (lane/direction polygons and a homography to the road plane). Results are exported as an annotated video and JSON/CSV logs, and each stage is evaluated separately: mAP for detection, IDF1/MOTA for tracking, and precision/recall/F1 for events.
+
 ![Modular_Diagram](/Modular_diagram.drawio.png)
