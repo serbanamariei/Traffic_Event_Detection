@@ -22,7 +22,7 @@ The data is first converted to YOLO format with a9-devkit. Vehicles are then det
 
 ## Label Conversion Examples
 
-The A9 R2 labels are 3D boxes annotated on LiDAR point clouds. A custom script projects them onto the camera images using the extrinsic and intrinsic calibration and converts them into 2D boxes in YOLO format. Below are two examples, one for each camera (`south1` and `south2`).
+The A9 R2 labels are 3D boxes annotated on LiDAR point clouds. The custom Python script `a9_to_yolo.py` projects them onto the camera images using the extrinsic and intrinsic calibration and converts them into 2D boxes in YOLO format. To verify that the conversion works, the script can draw the resulting boxes on the original images (`--debug` option). Below are two examples, one for each camera (`south1` and `south2`), where the projected boxes sit on the vehicles.
 
 ![South1 example](/Documentation/images/s01_1646667330_338743014_s110_camera_basler_south1_8mm.jpg)
 
