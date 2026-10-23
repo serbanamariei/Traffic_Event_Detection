@@ -19,3 +19,11 @@ The system is a modular pipeline for detecting traffic events (stopped vehicle, 
 The data is first converted to YOLO format with a9-devkit. Vehicles are then detected with a YOLO model trained on A9 and tracked with ByteTrack/BoT-SORT. From the resulting trajectories, the system computes features (speed, direction, acceleration, lane), which a rule-based event detection module uses together with a scene configuration (lane/direction polygons and a homography to the road plane). Results are exported as an annotated video and JSON/CSV logs, and each stage is evaluated separately: mAP for detection, IDF1/MOTA for tracking, and precision/recall/F1 for events.
 
 ![Modular_Diagram](/Modular_diagram.drawio.png)
+
+## Label Conversion Examples
+
+The A9 R2 labels are 3D boxes annotated on LiDAR point clouds. A custom script projects them onto the camera images using the extrinsic and intrinsic calibration and converts them into 2D boxes in YOLO format. Below are two examples, one for each camera (`south1` and `south2`).
+
+![South1 example](/Documentation/images/s01_1646667330_338743014_s110_camera_basler_south1_8mm.jpg)
+
+![South2 example](/Documentation/images/s01_1646667311_935973765_s110_camera_basler_south2_8mm.jpg)
