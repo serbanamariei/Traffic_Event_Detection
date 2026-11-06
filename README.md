@@ -18,4 +18,9 @@ The system is a modular pipeline for detecting traffic accidents from fixed high
 
 The A9 labels are first converted to YOLO format with TUMTraf-devkit, and the `accident` class is added as the union of the boxes of the involved vehicles, derived with heuristic rules. A YOLOv8 model is then trained on a time-based split of A9, with extra external data (Roboflow, TUMTraf Event) added to the training set only, and vehicles in the Roboflow images pseudo-labeled with a COCO-pretrained YOLOv8x. At inference, the model detects vehicles and accidents, the accident box is expanded to cover the involved vehicles, and a per-camera verdict is given. Results are exported as annotated images, and for new test sets also as a `detections.csv` log (frame, timestamp, confidence, involved vehicles, box). Evaluation uses mAP and the confusion matrix on an A9-only validation split, plus qualitative tests on unseen sets.
 
+## Modular Diagram
 ![Modular_Diagram](/Modular_diagram.png)
+
+## Examples:
+![Exemple cadre extrase cu accidente](/Documentation/images/imagine_accident1.jfif)
+![Exemple cadre extrase cu accidente2](/Documentation/images/imagine_accident2.jfif)
