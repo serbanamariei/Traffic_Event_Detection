@@ -21,8 +21,6 @@ def pick_image(image, folder):
 
 
 def summarize(dets, acc_conf):
-    """dets: list of (class_name, confidence, [x1, y1, x2, y2]).
-    Returns (object_counts, accident: bool, max_accident_confidence)."""
     counts = {}
     for name, _, _ in dets:
         if name != 'accident':
@@ -51,7 +49,6 @@ def main():
     res = model.predict(str(path), conf=min(args.conf, args.acc_conf), imgsz=args.imgsz, verbose=False)[0]
 
     dets = [(model.names[int(b.cls)].lower(), float(b.conf), b.xyxy[0].tolist()) for b in res.boxes]
-    # normal objects respect --conf; the accident has its own threshold
     dets = [d for d in dets if d[1] >= (args.acc_conf if d[0] == 'accident' else args.conf)]
     counts, accident, best = summarize(dets, args.acc_conf)
 
