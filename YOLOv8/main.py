@@ -3,6 +3,10 @@
 Examples:
     python main.py --folder tumtraf_yolo/val/images --weights best.pt   # random image from the folder
     python main.py --image photo.png --weights best.pt --acc-conf 0.4
+
+Project command:
+    python YOLOv8/main.py --folder YOLOv8/tumtraf_yolo/val/images --weights YOLOv8/best.pt
+    python YOLOv8/main.py --image YOLOv8/tumtraf_yolo/val/images/img.png --weights YOLOv8/best.pt
 """
 import argparse
 import random
