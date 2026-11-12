@@ -80,14 +80,12 @@ The script prints the detected objects and either `ACCIDENT DETECTED (confidence
 ### Correctly detected
 The red box is the `accident` class (confidence 0.50-0.58), the green boxes are vehicles. It works for a simple collision and for a multi-vehicle pile-up in fog. On the pile-up, two overlapping accident boxes appear, but the verdict is still correct.
 
-![Correct detections1](Documentation/images/CORECTE.png)
 ![Correct detections2](Documentation/images/rezultate_bune.png)
 
 
 ### Missed accidents
 Vehicles are detected (green boxes), but no `accident` box appears. These frames come from footage that differs from the A9 training domain (camera angle, night, external video compilations). The same intersection (orange car and dark SUV) is detected in one frame and missed in another, so a single frame is not reliable, which is why the verdict on new test sets requires several consecutive frames.
 
-![Missed accidents1](Documentation/images/GRESITE.png)
 ![Missed accidents2](Documentation/images/rezultate_rele.png)
 
 ## Limitations and Future Work
