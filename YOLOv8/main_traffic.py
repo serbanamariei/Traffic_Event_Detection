@@ -499,3 +499,390 @@ def traffic_events(name, times, kin, rtracks, P, args):
                 events.append(ev('hard_braking', name, [tid], j[a], j[b], t[a], t[b],
                                  f'decel {-np.nanmin(k["acc"][a:b + 1]):.1f} m/s2'))
     return events, cong
+
+
+# collisions
+
+def box_overlap(ba, bb):
+    iw, ih = min(ba[2], bb[2]) - max(ba[0], bb[0]), min(ba[3], bb[3]) - max(ba[1], bb[1])
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    area = lambda b: max(1.0, (b[2] - b[0]) * (b[3] - b[1]))
+    return iw * ih / min(area(ba), area(bb))
+
+
+def collisions(veh_frame, times, kin, args):
+    contact = defaultdict(list)
+    for j, vs in enumerate(veh_frame):
+        for p in range(len(vs)):
+            for q in range(p + 1, len(vs)):
+                (ta, _, ba, _), (tb, _, bb, _) = vs[p], vs[q]
+                if ta == tb or ta not in kin or tb not in kin:
+                    continue
+                if {kin[ta]['cls'], kin[tb]['cls']} == {'truck', 'trailer'}:
+                    continue
+                if box_overlap(ba, bb) >= args.contact_ioma:
+                    contact[(min(ta, tb), max(ta, tb))].append(j)
+    out = []
+    for (a, b), js in contact.items():
+        runs, cur = [], [js[0], js[0]]
+        for j in js[1:]:
+            if j - cur[1] <= 2:
+                cur[1] = j
+            else:
+                runs.append(cur)
+                cur = [j, j]
+        runs.append(cur)
+        for j0, j1 in runs:
+            if j1 - j0 < 1 or times[j1] - times[j0] < args.contact_secs:
+                continue
+            tc = times[j0]
+            pre, post = {}, {}
+            for i in (a, b):
+                w = win_vals(kin[i], tc - 1.5, tc - 0.1)
+                pre[i] = float(w.max()) if len(w) else NAN
+                w = win_vals(kin[i], tc + 0.3, tc + 2.0)
+                post[i] = float(np.median(w)) if len(w) else NAN
+            if not (np.isfinite(pre[a]) and np.isfinite(pre[b])):
+                continue    # one track starts at the contact itself or has no reliable speed
+            drops = [i for i in (a, b) if pre[i] >= args.v_move and np.isfinite(post[i])
+                     and (post[i] < args.v_stop or post[i] <= args.drop_ratio * pre[i])]
+            if not drops:
+                continue
+            strong = len(drops) == 2 or all(np.isfinite(post[i]) and post[i] < args.v_stop for i in (a, b))
+            out.append(dict(t0=tc, t1=times[j1], j0=j0, j1=j1, ids={a, b}, strong=strong))
+    return out
+
+
+# accident fusion
+
+CUE_WEIGHT = dict(overlap_at_stop=0.30, abrupt_stop=0.10, several_stopped_early=0.10, traffic_stopped_behind=0.10)
+
+
+def fuse_accidents(name, times, kin, rtracks, clusters, veh_frame, accs_frame, flags, best, cong, W, H, args):
+    if args.accident_mode == 'yolo':
+        evs, rows = [], []
+        for a, b, cnt in mf.find_runs(flags, args.max_gap):
+            ok = cnt >= max(1, min(args.min_frames, len(times)))
+            peak = max(best[a:b + 1])
+            rows.append(dict(sequence=name, t0=times[a], t1=times[b], src='yolo', score=peak,
+                             status='confirmed' if ok else 'rejected', detail=f'n={cnt} peak={peak:.2f}'))
+            if ok:
+                evs.append(ev('accident', name, [], a, b, times[a], times[b], f'yolo-only peak {peak:.2f}', peak))
+        return evs, rows
+
+    items = []      # candidate evidence from the three sources
+    for a, b, cnt in mf.find_runs(flags, args.max_gap):
+        ids = set()
+        for jj in range(a, b + 1):
+            if accs_frame[jj]:
+                bx = accs_frame[jj][0][1]
+                for tid, _, bb, _ in veh_frame[jj]:
+                    if bx[0] <= (bb[0] + bb[2]) / 2 <= bx[2] and bx[1] <= (bb[1] + bb[3]) / 2 <= bx[3]:
+                        ids.add(tid)
+        items.append(dict(kind='yolo', j0=a, j1=b, ids=ids, link=ids, n=cnt, peak=max(best[a:b + 1])))
+    for c in collisions(veh_frame, times, kin, args):
+        items.append(dict(kind='contact', j0=c['j0'], j1=c['j1'], ids=set(c['ids']), link=set(c['ids']), coll=c))
+    for cl in clusters:
+        items.append(dict(kind='rules', j0=int(cl['onset']), j1=int(cl['j1']), ids=set(cl['ids']), link=set(cl['link']), cl=cl))
+
+    parent = list(range(len(items)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            a, b = items[i], items[j]
+            if (times[a['j0']] <= times[b['j1']] + args.merge_tol and times[b['j0']] <= times[a['j1']] + args.merge_tol
+                    and (a['link'] & b['link'])):
+                parent[find(i)] = find(j)
+    groups = defaultdict(list)
+    for i, it in enumerate(items):
+        groups[find(i)].append(it)
+
+    evs, rows = [], []
+    with np.errstate(invalid='ignore'):
+        for grp in groups.values():
+            yolo = [g for g in grp if g['kind'] == 'yolo']
+            coll = [g['coll'] for g in grp if g['kind'] == 'contact']
+            rul = [g['cl'] for g in grp if g['kind'] == 'rules']
+            n = sum(g['n'] for g in yolo)
+            peak = max([g['peak'] for g in yolo], default=0.0)
+            cl = max(rul, key=lambda c: sum(CUE_WEIGHT[k] for k, v in c['cues'].items() if v), default=None)
+            cc = max(coll, key=lambda c: c['strong'], default=None)
+            if cl is not None:
+                ids = set(cl['ids'])
+            elif cc is not None:
+                ids = set(cc['ids'])
+            else:
+                ids = set().union(*[g['ids'] for g in yolo])
+            j0 = min(g['j0'] for g in grp)
+            j1 = max(g['j1'] for g in grp)
+            if cl is not None:
+                j0 = min(j0, int(cl['onset']))
+            t0 = times[j0]
+            kids = [i for i in ids if i in kin]
+            pre, post = {}, {}
+            for i in kids:
+                w = win_vals(kin[i], t0 - 3.0, t0 + 0.3)
+                pre[i] = float(w.max()) if len(w) else NAN
+                w = win_vals(kin[i], t0 + 0.3, t0 + 2.5)
+                post[i] = float(np.median(w)) if len(w) else NAN
+            drop = any(np.isfinite(pre[i]) and np.isfinite(post[i]) and pre[i] >= args.v_move
+                       and (post[i] < args.v_stop or post[i] <= args.drop_ratio * pre[i]) for i in kids)
+            halted = sum(1 for i in kids if np.isfinite(post[i]) and post[i] < args.v_stop) >= 2
+            parts = {}
+            if n:
+                parts['yolo'] = 0.5 * min(1.0, n / (2.0 * max(1, args.min_frames))) * min(1.0, peak / 0.6)
+            if cc is not None:
+                parts['contact'] = 0.25 + (0.05 if cc['strong'] else 0.0)
+            if cl is not None:
+                for k, v in cl['cues'].items():
+                    if v:
+                        parts[k] = CUE_WEIGHT[k]
+            if drop:
+                parts['speed_drop'] = 0.15
+            if halted:
+                parts['halted'] = 0.10
+            if cl is not None and not cl['cues']['overlap_at_stop']:
+                t_ref = min(j1, int(cl['onset']) + round(args.early_s / frame_period(times)))
+                st = [tr['sp'].get(t_ref) for tr in rtracks if tr['sp'].get(t_ref) is not None]
+                if len(st) >= 4 and sum(v < args.stop_rel for v in st) / len(st) >= 0.6:
+                    parts['global_stop'] = -0.20       # almost everybody is stopped: red light / jam, not a crash
+            if not rul and not coll and any(g['j0'] <= e['end_frame'] and e['start_frame'] <= g['j1'] for g in yolo for e in cong):
+                parts['in_congestion'] = -0.15
+            if not rul and not coll and len(ids) < 2:
+                parts['lt2_vehicles'] = -0.10
+            score = max(0.0, min(1.0, sum(parts.values())))
+            status = 'confirmed' if score >= args.acc_confirm else 'possible' if score >= args.acc_possible else 'rejected'
+            src = '+'.join(k for k, has in (('yolo', yolo), ('contact', coll), ('rules', rul)) if has)
+            detail = ' '.join(f'{k}={v:+.2f}' for k, v in parts.items())
+            rows.append(dict(sequence=name, t0=t0, t1=times[j1], src=src, score=score, status=status,
+                             detail=f'n={n} peak={peak:.2f} ids={sorted(ids)} rules_ok={cl["ok"] if cl else None} {detail}'))
+            if status != 'rejected':
+                kind = 'accident' if status == 'confirmed' else 'possible_accident'
+                evs.append(ev(kind, name, ids, j0, j1, t0, times[j1], f'score {score:.2f} [{src}] {detail}', score))
+    return evs, rows
+
+
+def analyze_sequence(name, times, W, H, veh_frame, accs_frame, flags, best, args):
+    cal = calibrate(veh_frame, W, H, args)
+    kin = build_tracks(veh_frame, times, W, H, args, cal)
+    P = rule_params(frame_period(times), args)
+    rtracks = rule_tracks(veh_frame, P, args)
+    clusters = stopped_clusters(rtracks, P, args)
+    events, cong = traffic_events(name, times, kin, rtracks, P, args)
+    acc_events, rows = fuse_accidents(name, times, {t: k for t, k in kin.items() if k['conf'] >= args.track_conf}, rtracks, clusters, veh_frame, accs_frame, flags, best, cong, W, H, args)
+    for e in events:
+        for a in acc_events:
+            if a['type'] == 'accident' and set(e['track_ids']) & set(a['track_ids']) and a['start_s'] - 3 <= e['start_s'] <= a['end_s'] + 10:
+                e['info'] += ' (part of accident)'
+    events += acc_events
+    events.sort(key=lambda e: (e['start_s'], e['type']))
+    return events, rows, kin, cal
+
+
+# rendering
+
+def put_label(im, text, x, y, color, fs, th):
+    import cv2
+    cv2.putText(im, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 0), th + 2, cv2.LINE_AA)
+    cv2.putText(im, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, fs, color, th, cv2.LINE_AA)
+
+
+def render_shot(files, veh_frame, accs_frame, kin, events, args, out, name, writer):
+    """Box colours: green = vehicle, blue = vehicle in a traffic event, orange = vehicle involved in an accident,
+    red = whole accident box. Label above each box: class, confidence, speed [, event name]."""
+    import cv2
+    spd = {(tid, int(j)): (s, r) for tid, k in kin.items() for j, s, r in zip(k['j'], k['sp'], k['rel'])}
+    ev_by, acc_by = defaultdict(lambda: defaultdict(set)), defaultdict(list)
+    for e in events:
+        for j in range(e['start_frame'], e['end_frame'] + 1):
+            if e['type'] in ACCIDENT_TYPES:
+                acc_by[j].append(e)
+            else:
+                for tid in e['track_ids']:
+                    ev_by[j][tid].add(EVENT_NAME[e['type']])
+    for j, f in enumerate(files):
+        active = j in acc_by or j in ev_by
+        if not (active or args.save_all or args.video):
+            continue
+        im = mf.load_image(f)
+        if im is None:
+            continue
+        fs, th = max(0.4, im.shape[1] / 1600), max(1, round(im.shape[1] / 640))
+        involved = {tid for e in acc_by.get(j, []) for tid in e['track_ids']}
+        for tid, nm, bx, cf in veh_frame[j]:
+            names = sorted(ev_by[j][tid]) if j in ev_by and tid in ev_by[j] else []
+            col = COLORS['involved'] if tid in involved else COLORS['event'] if names else COLORS['normal']
+            x1, y1, x2, y2 = map(int, bx)
+            cv2.rectangle(im, (x1, y1), (x2, y2), col, 2 * th)
+            sp, rel = spd.get((tid, j), (NAN, False))
+            speed = f'{"" if rel else "~"}{sp:.0f} km/h' if sp == sp else ''
+            wbox = x2 - x1
+            parts = [f'{nm.capitalize()} {cf:.2f}', speed] if wbox >= 60 else [f'{cf:.2f}', speed] if wbox >= 28 else []
+            label = ' | '.join(p for p in parts + names if p)
+            if label:
+                put_label(im, label, x1, max(y1 - 5, 12), col, fs, th)
+        for e in acc_by.get(j, []):
+            if accs_frame[j]:
+                conf, bx = accs_frame[j][0]
+                tail = f'conf={conf:.2f}'
+            else:
+                boxes = [b for tid, _, b, _ in veh_frame[j] if tid in e['track_ids']]
+                if not boxes:
+                    continue
+                bx = [min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes)]
+                tail = f'score={e["score"]:.2f}'
+            x1, y1, x2, y2 = map(int, bx)
+            if (x2 - x1) * (y2 - y1) > args.max_box_area * im.shape[0] * im.shape[1]:
+                continue
+            cv2.rectangle(im, (x1, y1), (x2, y2), COLORS['accident'], 3 * th)
+            put_label(im, f'{"Accident" if e["type"] == "accident" else "Possible accident"} {tail}',
+                      x1, max(y1 - 22 * th, 12), COLORS['accident'], fs, th)
+        if active or args.save_all:
+            (out / name).mkdir(parents=True, exist_ok=True)
+            cv2.imencode('.jpg', im)[1].tofile(str(out / name / (f.stem + '.jpg')))
+        if args.video:
+            if writer['w'] is None:
+                writer['w'] = cv2.VideoWriter(str(out / f'{name}.mp4'), cv2.VideoWriter_fourcc(*'mp4v'),
+                                              args.fps / max(1, args.stride), (im.shape[1], im.shape[0]))
+            writer['w'].write(im)
+
+
+# pipeline
+
+def extract(res, args):
+    """One tracked frame -> (vehicles [(id, class, box, conf)], accident boxes [(conf, box)], flag, best conf)."""
+    veh = []
+    ids = res.boxes.id
+    if ids is not None:
+        for b, tid in zip(res.boxes, ids.int().tolist()):
+            nm = res.names[int(b.cls[0])].lower()
+            cf = float(b.conf[0])
+            if nm in mf.NOT_VEHICLE or cf < args.conf:
+                continue
+            veh.append((tid, nm, b.xyxy[0].tolist(), cf))
+    _, accs = mf.analyze(res, args.conf, args.acc_conf, args.margin)
+    if accs:
+        return veh, [(c, big) for c, big, _ in accs], True, accs[0][0]
+    return veh, [], False, 0.0
+
+
+def process_folder(name, files, times, track_fn, args, out, sink):
+    writer = {'w': None}
+    state = {'shot': None, 'no': 0}
+
+    def finish(s):
+        n = len(s['files'])
+        events, rows, kin, cal = analyze_sequence(name, s['times'], s['W'], s['H'], s['veh'], s['accs'], s['flags'], s['best'], args)
+        model = (f"calibrated, camera height {cal['hcam']:.1f} m" if cal else 'approximate (uncalibrated)')
+        print(f"\n  Shot {s['no']}: {n} frames, t={s['times'][0]:.1f}-{s['times'][-1]:.1f}s, speed model: {model}", flush=True)
+        for e in events:
+            e['shot'] = s['no']
+            e['start_file'], e['end_file'] = s['files'][e['start_frame']].name, s['files'][e['end_frame']].name
+            print(f"    {e['type']:18s} +{e['start_s']:.1f}s ... +{e['end_s']:.1f}s | ids {e['track_ids']} | {e['info']}")
+        verdict = ('ACCIDENT' if any(e['type'] == 'accident' for e in events) else
+                   'POSSIBLE ACCIDENT' if any(e['type'] == 'possible_accident' for e in events) else 'no accident')
+        print(f'    => {verdict}', flush=True)
+        sink['events'] += events
+        sink['rows'] += [dict(r, shot=s['no']) for r in rows]
+        sink['summary'].append((name, s['no'], s['times'][0], s['times'][-1], n, len(kin), verdict,
+                                sorted({e['type'] for e in events} - set(ACCIDENT_TYPES))))
+        for tid, k in kin.items():
+            for i in range(len(k['t'])):
+                sink['tracks'].append([name, s['no'], tid, k['cls'], int(k['j'][i]), round(float(k['t'][i]), 3), round(float(k['x'][i]), 1),
+                                       round(float(k['y'][i]), 1), round(float(k['sp'][i]), 1), int(k['rel'][i]), round(float(k['acc'][i]), 2)])
+        render_shot(s['files'], s['veh'], s['accs'], kin, events, args, out, name, writer)
+
+    prev_small, prev_t = None, None
+    for j, f in enumerate(files):
+        im = mf.load_image(f)
+        if im is None:
+            continue
+        sm = small_gray(im)
+        cut = prev_small is not None and (is_cut(prev_small, sm, args) or times[j] - prev_t > args.gap_secs)
+        prev_small, prev_t = sm, times[j]
+        if state['shot'] is None or cut:
+            if state['shot'] is not None:
+                finish(state['shot'])
+            state['no'] += 1
+            state['shot'] = dict(no=state['no'], files=[], times=[], veh=[], accs=[], flags=[], best=[],
+                                 W=im.shape[1], H=im.shape[0], first=True)
+        s = state['shot']
+        res = track_fn(im, persist=not s['first'])      # persist=False resets the tracker at the start of a shot
+        s['first'] = False
+        veh, accs, flag, best = extract(res, args)
+        s['files'].append(f)
+        s['times'].append(times[j])
+        s['veh'].append(veh)
+        s['accs'].append(accs)
+        s['flags'].append(flag)
+        s['best'].append(best)
+    if state['shot'] is not None:
+        finish(state['shot'])
+    if writer['w'] is not None:
+        writer['w'].release()
+
+
+def get_args(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--folder', required=True, help='folder with frames; every sub-folder is one sequence')
+    ap.add_argument('--weights', default='best.pt')
+    ap.add_argument('--out', default='output_traffic')
+    return argparse.Namespace(**{**TUNING, **vars(ap.parse_args(argv))})
+
+
+def write_outputs(out, sink):
+    cols = ['sequence', 'shot', 'type', 'track_ids', 'start_s', 'end_s', 'score', 'start_frame', 'end_frame', 'start_file', 'end_file', 'info']
+    with open(out / 'events.csv', 'w', newline='', encoding='utf-8') as fh:
+        w = csv.writer(fh)
+        w.writerow(cols)
+        for e in sink['events']:
+            w.writerow([' '.join(map(str, e[c])) if c == 'track_ids' else e.get(c, '') for c in cols])
+    (out / 'events.json').write_text(json.dumps(sink['events'], indent=2, ensure_ascii=False), encoding='utf-8')
+    with open(out / 'accident_candidates.csv', 'w', newline='', encoding='utf-8') as fh:
+        w = csv.writer(fh)
+        w.writerow(['sequence', 'shot', 'start_s', 'end_s', 'source', 'score', 'status', 'detail'])
+        for r in sink['rows']:
+            w.writerow([r['sequence'], r['shot'], round(r['t0'], 2), round(r['t1'], 2), r['src'], round(r['score'], 3), r['status'], r['detail']])
+    with open(out / 'tracks.csv', 'w', newline='', encoding='utf-8') as fh:
+        w = csv.writer(fh)
+        w.writerow(['sequence', 'shot', 'track_id', 'class', 'frame', 'time_s', 'x', 'y', 'speed_kmh', 'speed_reliable', 'accel_ms2'])
+        w.writerows(sink['tracks'])
+
+
+def main():
+    args = get_args()
+    import torch
+    from ultralytics import YOLO
+
+    model = YOLO(args.weights)
+    prec = mf.precision_kwargs(args.device)
+    pred_conf = min(args.conf, args.acc_conf)
+
+    def track_fn(im, persist):
+        with torch.no_grad():
+            return model.track(im, persist=persist, tracker=args.tracker, conf=pred_conf, imgsz=args.imgsz,
+                               device=args.device, verbose=False, **prec)[0]
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    sink = dict(events=[], rows=[], tracks=[], summary=[])
+    for name, files in mf.collect_sequences(args.folder).items():
+        files = files[::max(1, args.stride)]
+        print(f'\nSequence: {name} ({len(files)} frames)', flush=True)
+        process_folder(name, files, frame_times(files, args), track_fn, args, out, sink)
+    write_outputs(out, sink)
+
+    print('\n=== SUMMARY ===')
+    for name, no, t0, t1, n, nt, verdict, others in sink['summary']:
+        print(f'{name[:30]:30s} shot {no:3d} {t0:7.1f}-{t1:7.1f}s {n:5d} frames {nt:4d} tracks  {verdict:18s} {", ".join(others)}')
+    print(f'\n{len(sink["events"])} events saved to {out.resolve() / "events.csv"}; accident candidates in accident_candidates.csv')
+
+
+if __name__ == '__main__':
+    main()
